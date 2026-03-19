@@ -1,0 +1,19 @@
+[package]
+name        = "cddlc-parser"
+version     = "0.1.0"
+edition     = "2021"
+description = "CDDL (RFC 8610) parser — AST + pragma extraction for cddlc"
+license     = "MIT OR Apache-2.0"
+
+[dependencies]
+# Parsing
+winnow      = "0.6"
+
+# Utilities
+indexmap    = "2"
+thiserror   = "1"
+smol_str    = "0.2"          # small, clone-cheap interned strings
+
+[dev-dependencies]
+insta       = { version = "1", features = ["ron"] }
+pretty_assertions = "1"
