@@ -41,6 +41,122 @@ pub fn parse_cddl(
     state.parse_module(src)
 }
 
+/// Parse with rich diagnostic output on failure.
+///
+/// On success returns the module and prints nothing.
+/// On failure prints a structured diagnostic to stderr and returns the error.
+///
+/// Diagnostic includes:
+///   - File, line, column
+///   - Source excerpt with caret pointer
+///   - Remaining unparsed input excerpt
+///   - Accumulated pending pragmas at the point of failure
+///   - Token context from winnow
+pub fn parse_cddl_debug(
+    src:  &str,
+    path: PathBuf,
+) -> Result<ParseResult<CddlModule>, ParseError> {
+    let mut state = ParseState::new(src, path.clone());
+    match state.parse_module(src) {
+        Ok(result) => {
+            if !result.warnings.is_empty() {
+                eprintln!("[cddlc-parse] {} warning(s):", result.warnings.len());
+                for w in &result.warnings {
+                    eprintln!("  {w}");
+                }
+            }
+            Ok(result)
+        }
+        Err(e) => {
+            eprintln!("\n{}", format_parse_diagnostic(src, &path, &e));
+            Err(e)
+        }
+    }
+}
+
+/// Format a rich diagnostic message for a parse error.
+pub fn format_parse_diagnostic(src: &str, path: &PathBuf, error: &ParseError) -> String {
+    let mut out = String::new();
+
+    out.push_str("━━━ cddlc parse error ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    match error {
+        ParseError::Syntax { line, col, message, span, .. } => {
+            out.push_str(&format!("  File : {}\n", path.display()));
+            out.push_str(&format!("  Line : {line}, Col: {col}\n"));
+            out.push_str(&format!("  Span : {}..{}\n", span.start, span.end));
+            out.push('\n');
+
+            // Source excerpt: 3 lines before + the failing line
+            let lines: Vec<&str> = src.lines().collect();
+            let line_idx = line.saturating_sub(1); // 0-based
+            let start_line = line_idx.saturating_sub(3);
+            out.push_str("  Source context:\n");
+            for (i, l) in lines[start_line..=line_idx.min(lines.len().saturating_sub(1))].iter().enumerate() {
+                let ln = start_line + i + 1;
+                if ln == *line {
+                    out.push_str(&format!("  {:>4} │ {}\n", ln, l));
+                    // Caret pointer
+                    let caret_pos = col.saturating_sub(1).min(l.len());
+                    out.push_str(&format!("       │ {}^\n", " ".repeat(caret_pos)));
+                } else {
+                    out.push_str(&format!("  {:>4} │ {}\n", ln, l));
+                }
+            }
+            out.push('\n');
+
+            // Remaining input at the failure point
+            let offset = span.start;
+            if offset < src.len() {
+                let remaining = &src[offset..];
+                let excerpt: String = remaining.chars().take(120).collect();
+                let excerpt_display = excerpt.replace('\n', "↵").replace('\t', "→");
+                out.push_str(&format!("  Remaining input at offset {offset}:\n"));
+                out.push_str(&format!("    ┌─ {:?}", excerpt_display));
+                if remaining.len() > 120 {
+                    out.push_str(" …");
+                }
+                out.push_str("\n\n");
+            }
+
+            // Parse the winnow error message for expected tokens
+            out.push_str("  Parser context:\n");
+            for line in message.lines() {
+                out.push_str(&format!("    {line}\n"));
+            }
+
+            // Common hints based on error content
+            out.push('\n');
+            out.push_str("  Hints:\n");
+            if message.contains("parse_ident") || message.contains("ident") {
+                out.push_str("  • Expected an identifier — check for reserved words or invalid characters\n");
+            }
+            if message.contains("assignop") || message.contains("\"=\"") {
+                out.push_str("  • Expected assignment operator = / /= / //=\n");
+            }
+            if message.contains("comment") || src[..offset.min(src.len())].contains(';') {
+                out.push_str("  • Comments use `;` to end-of-line; pragmas use `; @keyword value`\n");
+            }
+            if message.contains("map") || message.contains("group") {
+                out.push_str("  • Map/group entries use `key: type` or `key => type`\n");
+            }
+            if message.contains("type") {
+                out.push_str("  • Valid primitive types: uint, int, float, float32, float64, tstr, bstr, bool, null, any\n");
+            }
+        }
+        ParseError::ImportCycle { cycle } => {
+            out.push_str(&format!("  Import cycle: {}\n", cycle.join(" → ")));
+            out.push_str("  Hint: check your @import chain for circular dependencies\n");
+        }
+        other => {
+            out.push_str(&format!("  {other}\n"));
+        }
+    }
+
+    out.push_str("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    out
+}
+
 /// Parse a single type expression (useful for testing).
 pub fn parse_type_str(src: &str) -> Result<Type, String> {
     let mut input = src.trim();
@@ -81,9 +197,11 @@ impl ParseState {
         &mut self,
         src: &str,
     ) -> Result<ParseResult<CddlModule>, ParseError> {
+        let trace = std::env::var("CDDLC_TRACE").is_ok();
         let mut input = src;
         let mut rules: Vec<Spanned<Rule>> = Vec::new();
         let mut file_pragmas: Vec<Pragma> = Vec::new();
+        let mut rule_index = 0usize;
 
         loop {
             self.skip_ws_and_comments(&mut input, src);
@@ -96,21 +214,36 @@ impl ParseState {
             let pending = self.take_pragmas();
             for p in pending {
                 if p.keyword == "import" {
+                    if trace { eprintln!("[cddlc-trace] file pragma: @import {:?}", p.value); }
                     file_pragmas.push(p);
                 } else {
+                    if trace { eprintln!("[cddlc-trace] rule pragma pending: @{}", p.keyword); }
                     self.pending_pragmas.push(p);
                 }
             }
 
             let start = byte_offset(src, input);
+            let line  = line_of(src, start);
+            let col   = col_of(src, start);
+            if trace {
+                let preview: String = input.chars().take(40).collect();
+                let preview = preview.replace('\n', "↵");
+                eprintln!("[cddlc-trace] rule[{rule_index}] at {line}:{col} — {:?}", preview);
+            }
+
             let rule = self.parse_rule(&mut input, src)
                 .map_err(|e| ParseError::Syntax {
                     path:    self.path.clone(),
-                    line:    line_of(src, start),
-                    col:     col_of(src, start),
+                    line,
+                    col,
                     message: format!("{e:?}"),
                     span:    Span::new(start, start),
                 })?;
+
+            if trace {
+                eprintln!("[cddlc-trace] rule[{rule_index}] parsed: {:?}", rule.name.node.as_str());
+            }
+            rule_index += 1;
 
             let end = byte_offset(src, input);
             rules.push(Spanned::new(rule, Span::new(start, end)));
@@ -121,6 +254,11 @@ impl ParseState {
             if p.keyword == "import" {
                 file_pragmas.push(p);
             }
+        }
+
+        if trace {
+            eprintln!("[cddlc-trace] parse complete: {} rules, {} file_pragmas, {} warnings",
+                rules.len(), file_pragmas.len(), self.warnings.len());
         }
 
         let module = CddlModule {
@@ -137,6 +275,7 @@ impl ParseState {
     /// Skip whitespace and comment lines.  Pragma comments are parsed and
     /// pushed into `self.pending_pragmas`.
     fn skip_ws_and_comments(&mut self, input: &mut &str, src: &str) {
+        let trace = std::env::var("CDDLC_TRACE").is_ok();
         loop {
             // Skip whitespace
             let _ = multispace0::<_, ()>.parse_next(input);
@@ -153,10 +292,21 @@ impl ParseState {
                 let end = byte_offset(src, input);
                 let span = Span::new(start, end);
 
+                if trace {
+                    eprintln!("[cddlc-trace] comment line {line_no}: ;{comment_body}");
+                }
+
                 // Try to parse as pragma
                 match parse_pragma(comment_body, span, &self.path, line_no) {
-                    None => {} // ordinary comment
+                    None => {
+                        if trace {
+                            eprintln!("[cddlc-trace]   → ordinary comment (no pragma)");
+                        }
+                    }
                     Some(Ok(pragma)) => {
+                        if trace {
+                            eprintln!("[cddlc-trace]   → pragma @{} = {:?}", pragma.keyword, pragma.value);
+                        }
                         // Emit warning for Unknown pragmas
                         if let PragmaValue::Unknown(_) = &pragma.value {
                             self.add_warning(ParseWarning {
@@ -173,6 +323,9 @@ impl ParseState {
                         self.pending_pragmas.push(pragma);
                     }
                     Some(Err(warn)) => {
+                        if trace {
+                            eprintln!("[cddlc-trace]   → pragma parse warning: {}", warn.message);
+                        }
                         self.add_warning(warn);
                     }
                 }

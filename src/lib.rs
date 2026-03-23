@@ -35,7 +35,7 @@ pub use ast::{
     Type, Type1, Type2, TypeOp, Value,
 };
 pub use error::{ParseError, ParseResult, ParseWarning, WarningKind};
-pub use parser::{parse_cddl, parse_type_str};
+pub use parser::{parse_cddl, parse_cddl_debug, parse_type_str, format_parse_diagnostic};
 
 /// Prelude for consumers of this crate.
 pub mod prelude {
