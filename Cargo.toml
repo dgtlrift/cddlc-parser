@@ -15,5 +15,6 @@ thiserror   = "1"
 smol_str    = "0.2"          # small, clone-cheap interned strings
 
 [dev-dependencies]
-insta       = { version = "1", features = ["ron"] }
+cddlc-ir          = { path = "../cddlc-ir" }
+insta             = { version = "1", features = ["ron"] }
 pretty_assertions = "1"

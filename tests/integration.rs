@@ -319,3 +319,107 @@ d = a / b / c
     assert_eq!(m.rules[0].node.name.node.as_str(), "a");
     assert_eq!(m.rules[3].node.name.node.as_str(), "d");
 }
+
+// ── Inline comment handling ───────────────────────────────────────────────────
+
+#[test]
+fn test_inline_comment_after_comma() {
+    // The original failing case: `;` comment after a value+comma on same line
+    let src = r#"TestFormat = (
+    feild_test: uint .size 4, ; This comment broke the parser
+)"#;
+    let m = parse(src);
+    assert_eq!(m.rules.len(), 1);
+    let rule = &m.rules[0].node;
+    if let RuleKind::Group { group, .. } = &rule.kind {
+        let entries = &group.node.choices[0].entries;
+        assert_eq!(entries.len(), 1, "expected 1 field, got {}", entries.len());
+    } else {
+        panic!("expected group rule");
+    }
+}
+
+#[test]
+fn test_inline_comment_multiple_fields() {
+    let src = r#"sensor = {
+    id:    uint,           ; unique sensor id
+    label: tstr,           ; human-readable name
+    value: float32,        ; last reading
+}"#;
+    let m = parse(src);
+    assert_eq!(m.rules.len(), 1);
+    let rule = &m.rules[0].node;
+    if let RuleKind::Type { ty, .. } = &rule.kind {
+        if let Type2::Map(group) = &ty.node.choices[0].node.base.node {
+            let entries = &group.node.choices[0].entries;
+            assert_eq!(entries.len(), 3, "expected 3 fields, got {}", entries.len());
+        } else {
+            panic!("expected map");
+        }
+    } else {
+        panic!("expected type rule");
+    }
+}
+
+#[test]
+fn test_inline_comment_on_last_field_no_trailing_comma() {
+    // Inline comment on the last field which has no trailing comma
+    let src = r#"msg = {
+    id:   uint,   ; required
+    text: tstr    ; optional in practice but required here
+}"#;
+    let m = parse(src);
+    assert_eq!(m.rules.len(), 1);
+}
+
+#[test]
+fn test_inline_comment_in_group_rule() {
+    // Group rule (parentheses) with inline comments — the exact failing schema
+    let src = r#"; This is a CDDL comment
+
+TestFormat = (
+; This field below has an inline comment
+    feild_test: uint .size 4, ; This comment breaks the parser
+)
+"#;
+    let m = parse(src);
+    assert_eq!(m.rules.len(), 1);
+    assert_eq!(m.rules[0].node.name.node.as_str(), "TestFormat");
+}
+
+#[test]
+fn test_inline_comment_between_type_choices() {
+    // Inline comment between `/` type alternatives
+    let src = "status = \"ok\" ; ok\n    / \"warn\" ; warn\n    / \"error\" ; error";
+    let m = parse(src);
+    assert_eq!(m.rules.len(), 1);
+    if let RuleKind::Type { ty, .. } = &m.rules[0].node.kind {
+        assert_eq!(ty.node.choices.len(), 3);
+    } else {
+        panic!("expected type rule");
+    }
+}
+
+#[test]
+fn test_inline_comment_with_pragma_on_preceding_line() {
+    // Mix of pragma comments and inline comments
+    let src = r#"; @capacity 4
+readings = [
+    * float32, ; each reading is a 32-bit float
+]
+"#;
+    let m = parse(src);
+    assert_eq!(m.rules.len(), 1);
+    assert_eq!(m.rules[0].node.pragmas.len(), 1);
+}
+
+#[test]
+fn test_inline_comment_only_comment_no_fields_after() {
+    // Inline comment after the last field before closing brace
+    let src = r#"device = {
+    id: uint, ; the device id
+    name: tstr ; the device name — no comma, inline comment
+}"#;
+    let m = parse(src);
+    assert_eq!(m.rules.len(), 1);
+}

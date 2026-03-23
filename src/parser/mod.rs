@@ -441,12 +441,12 @@ pub(crate) fn parse_type(input: &mut &str) -> ModalResult<Type> {
     let choices = separated(
         1..,
         |i: &mut &str| {
-            ws0(i);
+            wsc0(i);
             let t1 = parse_type1(i)?;
-            ws0(i);
+            wsc0(i);
             Ok(t1)
         },
-        (ws0_fn, literal("/"), ws0_fn, peek(none_of('/'))),
+        (wsc0_fn, literal("/"), wsc0_fn, peek(none_of('/'))),
     )
     .parse_next(input)?;
 
@@ -500,14 +500,14 @@ fn parse_type1(input: &mut &str) -> ModalResult<Spanned<Type1>> {
 }
 
 fn parse_type2_spanned(input: &mut &str) -> ModalResult<Spanned<Type2>> {
-    ws0(input);
+    wsc0(input);
     let t2 = parse_type2(input)?;
     Ok(Spanned::new(t2, Span::new(0, 0)))
 }
 
 /// Parse a `type2` atom.
 fn parse_type2(input: &mut &str) -> ModalResult<Type2> {
-    ws0(input);
+    wsc0(input);
 
     alt((
         // Tagged: #6.NN(type)
@@ -665,7 +665,7 @@ fn parse_group_choice(
     let mut entries = Vec::new();
 
     loop {
-        ws0(input);
+        wsc0(input);  // skip whitespace + inline comments between entries
         // Stop at closing delimiter or `//` separator
         if input.is_empty()
             || (close_ch != '\0' && input.starts_with(close_ch))
@@ -677,10 +677,11 @@ fn parse_group_choice(
         let entry = parse_member_entry(input)?;
         entries.push(Spanned::new(entry, Span::new(0, 0)));
 
-        ws0(input);
+        wsc0(input);  // skip whitespace + inline comments after value, before comma
         // Optional trailing/separating comma
         if input.starts_with(',') {
             let _ = literal::<_, _, ContextError>(",").parse_next(input)?;
+            wsc0(input);  // skip inline comment after comma: `value, ; comment\n`
         } else {
             break;
         }
@@ -691,12 +692,12 @@ fn parse_group_choice(
 
 /// Parse a single member entry (occurrence? key: value  or  occurrence? type).
 fn parse_member_entry(input: &mut &str) -> ModalResult<MemberEntry> {
-    ws0(input);
+    wsc0(input);  // handle inline comment before entry
 
     // Occurrence indicator
     let occurrence = parse_occurrence(input)?;
 
-    ws0(input);
+    wsc0(input);
 
     // Try key: value first, then bare type
     let kind = if let Some(kv) = try_parse_key_value(input)? {
@@ -1031,6 +1032,28 @@ fn ws0_fn(input: &mut &str) -> ModalResult<()> {
     Ok(())
 }
 
+/// Skip whitespace AND any `;`-to-end-of-line comments.
+/// Used inside group/type parsing where inline comments can appear
+/// after a value or comma on the same line.
+fn wsc0(input: &mut &str) {
+    loop {
+        let _ = multispace0::<_, ()>.parse_next(input);
+        if input.starts_with(';') {
+            // Consume `;` and everything up to (but not including) the newline
+            let _ = one_of::<_, _, ()>(';').parse_next(input);
+            let _ = take_till::<_, _, ()>(0.., |c| c == '\n').parse_next(input);
+            // The newline itself will be consumed by multispace0 on the next iteration
+        } else {
+            break;
+        }
+    }
+}
+
+fn wsc0_fn(input: &mut &str) -> ModalResult<()> {
+    wsc0(input);
+    Ok(())
+}
+
 // ── Offset helpers ────────────────────────────────────────────────────────────
 
 fn byte_offset(src: &str, remaining: &str) -> usize {
@@ -1188,6 +1211,32 @@ mod tests {
     }
 
     // ── Full module parse ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_inline_comment_after_field() {
+        // Inline comment after a field value — the original failing case
+        let src = r#"TestFormat = (
+    field_a: uint .size 4, ; This comment broke the parser
+    field_b: tstr,         ; Another inline comment
+)"#;
+        let result = parse_cddl(src, PathBuf::from("test.cddl")).unwrap();
+        assert_eq!(result.value.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_inline_comment_after_last_field() {
+        // Inline comment on the last field (no trailing comma)
+        let src = "sensor = { id: uint, value: float32 } ; end comment";
+        let result = parse_cddl(src, PathBuf::from("test.cddl")).unwrap();
+        assert_eq!(result.value.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_inline_comment_in_type_choice() {
+        let src = "status = \"ok\" ; ok variant\n    / \"warn\" ; warn variant\n    / \"error\"";
+        let result = parse_cddl(src, PathBuf::from("test.cddl")).unwrap();
+        assert_eq!(result.value.rules.len(), 1);
+    }
 
     #[test]
     fn test_parse_simple_module() {
