@@ -423,3 +423,82 @@ fn test_inline_comment_only_comment_no_fields_after() {
     let m = parse(src);
     assert_eq!(m.rules.len(), 1);
 }
+
+// ── Enumeration (&) expressions — RFC 8610 §3.9 ──────────────────────────────
+
+#[test]
+fn test_enum_ref_named() {
+    // &typename as a standalone type alias (RFC 8610 §3.9)
+    let m = parse(r#"
+        terminal-type = (
+            garden-controller: 1,
+            battery-powered:   2,
+            solar-powered:     3,
+        )
+        device-kind = &terminal-type
+    "#);
+    assert_eq!(m.rules.len(), 2);
+    let rule = &m.rules[1].node;
+    assert_eq!(rule.name.node.as_str(), "device-kind");
+    if let RuleKind::Type { ty, .. } = &rule.kind {
+        assert!(
+            matches!(&ty.node.choices[0].node.base.node, Type2::EnumTypename { name, .. }
+                if name.node.as_str() == "terminal-type"),
+            "expected EnumTypename(terminal-type)"
+        );
+    } else {
+        panic!("expected type rule");
+    }
+}
+
+#[test]
+fn test_enum_ref_inline_group() {
+    // &(group) inline enumeration as a type (RFC 8610 §3.9)
+    let m = parse(r#"
+        priority = &(
+            low:    1,
+            medium: 2,
+            high:   3,
+        )
+    "#);
+    assert_eq!(m.rules.len(), 1);
+    let rule = &m.rules[0].node;
+    assert_eq!(rule.name.node.as_str(), "priority");
+    if let RuleKind::Type { ty, .. } = &rule.kind {
+        assert!(
+            matches!(&ty.node.choices[0].node.base.node, Type2::EnumGroup(_)),
+            "expected EnumGroup"
+        );
+    } else {
+        panic!("expected type rule");
+    }
+}
+
+#[test]
+fn test_enum_ref_in_struct_field() {
+    // &typename used as the value type of a struct field (RFC 8610 §3.9)
+    let m = parse(r#"
+        terminal-type = (
+            garden-controller: 1,
+            battery-powered:   2,
+            solar-powered:     3,
+        )
+        device = {
+            id:   uint,
+            kind: &terminal-type,
+        }
+    "#);
+    assert_eq!(m.rules.len(), 2);
+}
+
+#[test]
+fn test_enum_ref_inline_in_struct_field() {
+    // &(group) inline enumeration used directly as a struct field type
+    let m = parse(r#"
+        message = {
+            priority: &(low: 1, medium: 2, high: 3),
+            payload:  bstr,
+        }
+    "#);
+    assert_eq!(m.rules.len(), 1);
+}

@@ -516,6 +516,8 @@ fn parse_type2(input: &mut &str) -> ModalResult<Type2> {
         parse_major_type,
         // Unwrapped group ref: ~ident
         parse_unwrap,
+        // Enumeration: &(group) or &typename  (RFC 8610 §3.9)
+        parse_enum_ref,
         // Map: { group }
         parse_map_type,
         // Array: [ group ]
@@ -564,6 +566,48 @@ fn parse_unwrap(input: &mut &str) -> ModalResult<Type2> {
     ws0(input);
     let name = parse_ident(input)?;
     Ok(Type2::Unwrap(Spanned::new(Ident::new(name), Span::new(0, 0))))
+}
+
+/// Parse an enumeration expression: `&(group)` or `&typename` (RFC 8610 §3.9).
+fn parse_enum_ref(input: &mut &str) -> ModalResult<Type2> {
+    literal("&").parse_next(input)?;
+    ws0(input);
+    if input.starts_with('(') {
+        // &( group )
+        let _ = literal("(").parse_next(input)?;
+        ws0(input);
+        let group = parse_group_entry_inner(input, ')')?;
+        ws0(input);
+        cut_err(literal(")"))
+            .context(StrContext::Expected(StrContextValue::Description("')' to close enum group")))
+            .parse_next(input)?;
+        Ok(Type2::EnumGroup(Spanned::new(group, Span::new(0, 0))))
+    } else {
+        // &typename [genericargs]
+        let name = cut_err(parse_ident)
+            .context(StrContext::Expected(StrContextValue::Description("identifier after '&'")))
+            .parse_next(input)?;
+        ws0(input);
+        let args: Vec<Spanned<Type>> = if input.starts_with('<') {
+            let _ = literal::<_, _, ContextError>("<").parse_next(input)?;
+            let args: Vec<Type> = separated(
+                1..,
+                |i: &mut &str| { ws0(i); let t = parse_type(i)?; ws0(i); Ok(t) },
+                (ws0_fn, literal(","), ws0_fn),
+            )
+            .parse_next(input)?;
+            cut_err(literal(">"))
+                .context(StrContext::Expected(StrContextValue::Description("'>' to close generic args")))
+                .parse_next(input)?;
+            args.into_iter().map(|t| Spanned::new(t, Span::new(0, 0))).collect()
+        } else {
+            vec![]
+        };
+        Ok(Type2::EnumTypename {
+            name: Spanned::new(Ident::new(name), Span::new(0, 0)),
+            args,
+        })
+    }
 }
 
 fn parse_map_type(input: &mut &str) -> ModalResult<Type2> {

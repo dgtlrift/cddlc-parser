@@ -149,6 +149,15 @@ pub enum Type2 {
 
     /// The `#` catch-all (any CBOR data item)
     Any,
+
+    /// Enumeration of an inline group: `&( group )` (RFC 8610 §3.9)
+    EnumGroup(Spanned<GroupEntry>),
+
+    /// Enumeration of a named group rule: `&typename` (RFC 8610 §3.9)
+    EnumTypename {
+        name: Spanned<Ident>,
+        args: Vec<Spanned<super::Type>>,
+    },
 }
 
 // ── Pragma ────────────────────────────────────────────────────────────────────
