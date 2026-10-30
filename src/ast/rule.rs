@@ -14,6 +14,13 @@ pub struct Rule {
     /// Pragmas that immediately precede this rule (attached pragmas).
     pub pragmas: Vec<Pragma>,
 
+    /// Its documentation: the plain comment lines directly above it (no blank line in
+    /// between), and a comment at the end of its last line (dgtlrift/cddlc#8).
+    pub doc: Option<String>,
+
+    /// Where it was written (dgtlrift/cddlc#9).
+    pub source: Option<super::SourceLine>,
+
     pub name: Spanned<Ident>,
 
     /// Generic parameters, if any: `foo<T, U> = ...`
@@ -64,6 +71,13 @@ pub struct MemberEntry {
 
     /// Pragmas attached to this specific member.
     pub pragmas: Vec<Pragma>,
+
+    /// Its documentation: the comment lines directly above it, an `@doc` pragma among
+    /// them, and a comment on its own line after it (dgtlrift/cddlc#8).
+    pub doc: Option<String>,
+
+    /// Where it was written (dgtlrift/cddlc#9).
+    pub source: Option<super::SourceLine>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

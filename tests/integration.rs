@@ -502,3 +502,92 @@ fn test_enum_ref_inline_in_struct_field() {
     "#);
     assert_eq!(m.rules.len(), 1);
 }
+
+// ── Comments as documentation and source lines (dgtlrift/cddlc#8, #9) ────────
+
+mod comments_and_sources {
+    use cddlc_parser::{parse_cddl, CddlModule, MemberEntry, MemberKind, RuleKind, Type2};
+    use std::path::PathBuf;
+
+    const SRC: &str = "; File comment, cut off by the blank line.
+
+; A reading from one sensor.
+; Taken every second.
+reading = {
+  id: uint,          ; the sensor's id
+  ; The value, in degrees Celsius.
+  celsius: float64,
+
+  ; Separated by a blank line: documents nothing.
+
+  ; @doc \"Its unit.\"
+  unit: unit-kind,
+}
+
+unit-kind = \"c\" / \"f\"   ; Celsius or Fahrenheit
+; Directly above: documents `n`.
+n = uint
+";
+
+    fn module() -> CddlModule {
+        parse_cddl(SRC, PathBuf::from("schema/r.cddl")).unwrap().value
+    }
+
+    fn members(m: &CddlModule) -> Vec<MemberEntry> {
+        let RuleKind::Type { ty, .. } = &m.rules[0].node.kind else { panic!("type rule") };
+        let Type2::Map(g) = &ty.node.choices[0].node.base.node else { panic!("map") };
+        g.node.choices[0].entries.iter().map(|e| e.node.clone()).collect()
+    }
+
+    #[test]
+    fn rules_are_documented_by_the_block_above_and_a_same_line_comment() {
+        let m = module();
+        let docs: Vec<Option<&str>> = m.rules.iter().map(|r| r.node.doc.as_deref()).collect();
+        assert_eq!(
+            docs,
+            [
+                Some("A reading from one sensor.\nTaken every second."),
+                Some("Celsius or Fahrenheit"),
+                Some("Directly above: documents `n`."),
+            ]
+        );
+    }
+
+    #[test]
+    fn members_are_documented_above_on_their_line_and_by_doc() {
+        let docs: Vec<Option<String>> = members(&module()).into_iter().map(|e| e.doc).collect();
+        assert_eq!(
+            docs,
+            [
+                Some("the sensor's id".to_owned()),
+                Some("The value, in degrees Celsius.".to_owned()),
+                Some("Its unit.".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rules_and_members_know_their_source_lines() {
+        let m = module();
+        let rules: Vec<(usize, String)> = m.rules.iter()
+            .map(|r| { let s = r.node.source.as_ref().unwrap(); (s.line, s.text.clone()) })
+            .collect();
+        assert_eq!(rules[0], (5, "reading = {".to_owned()));
+        assert_eq!(rules[1], (16, "unit-kind = \"c\" / \"f\"   ; Celsius or Fahrenheit".to_owned()));
+        assert_eq!(rules[2].0, 18);
+        let lines: Vec<(usize, String)> = members(&m).iter()
+            .map(|e| { let s = e.source.as_ref().unwrap(); (s.line, s.text.clone()) })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (6, "id: uint,          ; the sensor's id".to_owned()),
+                (8, "celsius: float64,".to_owned()),
+                (13, "unit: unit-kind,".to_owned()),
+            ]
+        );
+        assert_eq!(m.rules[0].node.source.as_ref().unwrap().path, PathBuf::from("schema/r.cddl"));
+        let keys: Vec<bool> = members(&m).iter().map(|e| matches!(e.kind, MemberKind::KeyValue { .. })).collect();
+        assert_eq!(keys, [true, true, true]);
+    }
+}

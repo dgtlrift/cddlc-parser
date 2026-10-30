@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use crate::ast::{
     CddlModule, CtlOp, GroupChoice, GroupEntry, Ident, MemberEntry, MemberKey,
-    MemberKind, Occurrence, Pragma, PragmaValue, Rule, RuleKind, Span, Spanned,
+    MemberKind, Occurrence, Pragma, PragmaValue, Rule, RuleKind, SourceLine, Span, Spanned,
     Type, Type1, Type2, TypeOp, Value,
 };
 use crate::error::{ParseError, ParseResult, ParseWarning, WarningKind};
@@ -171,6 +171,13 @@ struct ParseState {
     /// Pending pragmas accumulated from comment lines, to be attached to the
     /// next rule or group member.
     pending_pragmas: Vec<Pragma>,
+    /// Plain comment lines since the last blank line, to document the next rule
+    /// (dgtlrift/cddlc#8).
+    pending_doc: Vec<String>,
+    /// A comment on the same line as the end of the rule just parsed.
+    trailing_doc: Option<String>,
+    /// A rule has been parsed: a comment before any line break can trail it.
+    seen_rule: bool,
 }
 
 impl ParseState {
@@ -179,6 +186,9 @@ impl ParseState {
             path,
             warnings: Vec::new(),
             pending_pragmas: Vec::new(),
+            pending_doc: Vec::new(),
+            trailing_doc: None,
+            seen_rule: false,
         }
     }
 
@@ -202,9 +212,16 @@ impl ParseState {
         let mut rules: Vec<Spanned<Rule>> = Vec::new();
         let mut file_pragmas: Vec<Pragma> = Vec::new();
         let mut rule_index = 0usize;
+        SRC_LEN.with(|l| l.set(src.len()));
 
         loop {
             self.skip_ws_and_comments(&mut input, src);
+            // A comment on the last line of the rule just parsed documents it.
+            if let Some(t) = self.trailing_doc.take() {
+                if let Some(last) = rules.last_mut() {
+                    push_doc(&mut last.node.doc, &t);
+                }
+            }
             if input.is_empty() {
                 break;
             }
@@ -246,6 +263,13 @@ impl ParseState {
             rule_index += 1;
 
             let end = byte_offset(src, input);
+            self.seen_rule = true;
+            let mut rule = rule;
+            rule.source = Some(source_line(src, &self.path, rule.name.span.start));
+            match &mut rule.kind {
+                RuleKind::Type { ty, .. } => sources_in_type(&mut ty.node, src, &self.path),
+                RuleKind::Group { group, .. } => sources_in_group(&mut group.node, src, &self.path),
+            }
             rules.push(Spanned::new(rule, Span::new(start, end)));
         }
 
@@ -276,9 +300,18 @@ impl ParseState {
     /// pushed into `self.pending_pragmas`.
     fn skip_ws_and_comments(&mut self, input: &mut &str, src: &str) {
         let trace = std::env::var("CDDLC_TRACE").is_ok();
+        // Line breaks crossed since the last token (the end of the previous rule); at the
+        // start of the file, a comment trails nothing.
+        let mut breaks = usize::from(!self.seen_rule);
         loop {
-            // Skip whitespace
-            let _ = multispace0::<_, ()>.parse_next(input);
+            // Skip whitespace; a blank line ends a comment block, which then documents
+            // nothing (dgtlrift/cddlc#8).
+            let ws = multispace0::<_, ()>.parse_next(input).unwrap_or("");
+            let nl = ws.matches('\n').count();
+            breaks += nl;
+            if nl >= 2 {
+                self.pending_doc.clear();
+            }
 
             if input.starts_with(';') {
                 let line_no = line_of(src, byte_offset(src, input));
@@ -301,6 +334,16 @@ impl ParseState {
                     None => {
                         if trace {
                             eprintln!("[cddlc-trace]   → ordinary comment (no pragma)");
+                        }
+                        let text = comment_text(comment_body);
+                        if breaks == 0 {
+                            // On the line the previous rule ended on.
+                            match &mut self.trailing_doc {
+                                Some(t) => { t.push('\n'); t.push_str(&text); }
+                                None => self.trailing_doc = Some(text),
+                            }
+                        } else {
+                            self.pending_doc.push(text);
                         }
                     }
                     Some(Ok(pragma)) => {
@@ -343,6 +386,7 @@ impl ParseState {
         src:   &str,
     ) -> ModalResult<Rule> {
         let pragmas = self.take_pragmas();
+        let doc = join_doc(&std::mem::take(&mut self.pending_doc));
 
         // name [generic-params] assignop type-or-group
         let name_start = byte_offset(src, input);
@@ -382,7 +426,7 @@ impl ParseState {
             }
         };
 
-        Ok(Rule { pragmas, name, generic_params, kind })
+        Ok(Rule { pragmas, doc, source: None, name, generic_params, kind })
     }
 }
 
@@ -442,9 +486,10 @@ pub(crate) fn parse_type(input: &mut &str) -> ModalResult<Type> {
         1..,
         |i: &mut &str| {
             wsc0(i);
-            let t1 = parse_type1(i)?;
-            wsc0(i);
-            Ok(t1)
+            // What follows is left for the separator, which skips comments only when a
+            // `/` comes next: a comment after the type documents what holds it
+            // (dgtlrift/cddlc#8).
+            parse_type1(i)
         },
         (wsc0_fn, literal("/"), wsc0_fn, peek(none_of('/'))),
     )
@@ -463,6 +508,9 @@ fn parse_type1(input: &mut &str) -> ModalResult<Spanned<Type1>> {
     let mut ops: Vec<TypeOp> = Vec::new();
 
     loop {
+        // Whitespace is skipped only if an operator follows, so the line breaks after the
+        // type are still there for the comment handling (dgtlrift/cddlc#8).
+        let before = *input;
         ws0(input);
 
         if input.starts_with("...") {
@@ -491,6 +539,7 @@ fn parse_type1(input: &mut &str) -> ModalResult<Spanned<Type1>> {
             });
             // Loop — another control op may follow (e.g. `.ge -40 .le 85`)
         } else {
+            *input = before;
             break;
         }
     }
@@ -702,14 +751,18 @@ fn parse_group_entry_inner(
 }
 
 /// Parse one group choice: a sequence of member entries separated by `,`.
+///
+/// Comments between entries document them (dgtlrift/cddlc#8): the lines directly above
+/// an entry (no blank line in between), an `@doc` pragma among them, and a comment on
+/// the line an entry ends on, before or after its comma.
 fn parse_group_choice(
     input:    &mut &str,
     close_ch: char,
 ) -> ModalResult<GroupChoice> {
-    let mut entries = Vec::new();
+    let mut entries: Vec<Spanned<MemberEntry>> = Vec::new();
+    let mut above = wsc_collect(input);
 
     loop {
-        wsc0(input);  // skip whitespace + inline comments between entries
         // Stop at closing delimiter or `//` separator
         if input.is_empty()
             || (close_ch != '\0' && input.starts_with(close_ch))
@@ -718,17 +771,25 @@ fn parse_group_choice(
             break;
         }
 
-        let entry = parse_member_entry(input)?;
-        entries.push(Spanned::new(entry, Span::new(0, 0)));
+        let start = here(input);
+        let mut entry = parse_member_entry(input)?;
+        let end = here(input);
+        entry.doc = above.leading();
 
-        wsc0(input);  // skip whitespace + inline comments after value, before comma
-        // Optional trailing/separating comma
-        if input.starts_with(',') {
+        let mut after = wsc_collect(input);  // after value, before comma
+        let comma = input.starts_with(',');
+        if comma {
             let _ = literal::<_, _, ContextError>(",").parse_next(input)?;
-            wsc0(input);  // skip inline comment after comma: `value, ; comment\n`
-        } else {
+            after.extend(wsc_collect(input));  // `value, ; comment\n`
+        }
+        if let Some(t) = after.trailing() {
+            push_doc(&mut entry.doc, &t);
+        }
+        entries.push(Spanned::new(entry, Span::new(start, end)));
+        if !comma {
             break;
         }
+        above = after;
     }
 
     Ok(GroupChoice { entries })
@@ -755,6 +816,8 @@ fn parse_member_entry(input: &mut &str) -> ModalResult<MemberEntry> {
         occurrence: occurrence.map(|o| Spanned::new(o, Span::new(0, 0))),
         kind,
         pragmas: vec![],  // member-level pragmas handled at rule level
+        doc: None,
+        source: None,
     })
 }
 
@@ -1104,8 +1167,145 @@ fn byte_offset(src: &str, remaining: &str) -> usize {
     src.len() - remaining.len()
 }
 
+/// The 1-based line of `offset`. (`str::lines` counted one short at a line's start.)
 fn line_of(src: &str, offset: usize) -> usize {
-    src[..offset.min(src.len())].lines().count().max(1)
+    src[..offset.min(src.len())].matches('\n').count() + 1
+}
+
+// ── Comments as documentation (dgtlrift/cddlc#8) ──────────────────────────────
+
+thread_local! {
+    /// The length of the source being parsed, so the stateless group parsers can tell
+    /// an entry's byte offset from the input that remains.
+    static SRC_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The byte offset of `input` in the source being parsed.
+fn here(input: &str) -> usize {
+    SRC_LEN.with(std::cell::Cell::get).saturating_sub(input.len())
+}
+
+/// A comment's text: after the `;`, with one leading space and trailing blanks removed.
+fn comment_text(body: &str) -> String {
+    body.strip_prefix(' ').unwrap_or(body).trim_end().to_owned()
+}
+
+/// Comment lines as one documentation string, blank first and last lines dropped.
+fn join_doc(lines: &[String]) -> Option<String> {
+    let start = lines.iter().position(|l| !l.is_empty())?;
+    let end = lines.iter().rposition(|l| !l.is_empty())?;
+    Some(lines[start..=end].join("\n"))
+}
+
+/// Appends `text` to a documentation string, on its own line.
+fn push_doc(doc: &mut Option<String>, text: &str) {
+    match doc {
+        Some(d) => { d.push('\n'); d.push_str(text); }
+        None => *doc = Some(text.to_owned()),
+    }
+}
+
+/// Whitespace and comments skipped between group entries: each comment's text, and
+/// the line breaks before it in this stretch.
+#[derive(Default)]
+struct Stretch {
+    comments: Vec<(usize, String)>,
+    breaks:   usize,
+}
+
+impl Stretch {
+    fn extend(&mut self, other: Stretch) {
+        let base = self.breaks;
+        self.comments.extend(other.comments.into_iter().map(|(b, t)| (base + b, t)));
+        self.breaks += other.breaks;
+    }
+
+    /// The comments on the line the stretch starts on: they end the previous entry.
+    fn trailing(&self) -> Option<String> {
+        let lines: Vec<String> = self.comments.iter()
+            .filter(|(b, _)| *b == 0)
+            .map(|(_, t)| t.clone())
+            .collect();
+        join_doc(&lines)
+    }
+
+    /// The block of comment lines directly above the next entry: consecutive lines,
+    /// the last on the line before it.
+    fn leading(&self) -> Option<String> {
+        let mut block: Vec<String> = Vec::new();
+        let mut next = self.breaks;  // the line the entry is on
+        for (b, t) in self.comments.iter().rev() {
+            if *b == 0 || *b + 1 != next {
+                break;
+            }
+            block.push(t.clone());
+            next = *b;
+        }
+        block.reverse();
+        join_doc(&block)
+    }
+}
+
+/// Skips whitespace and comments like [`wsc0`], keeping the comments: plain text, or
+/// an `@doc` pragma's text. Other pragmas are skipped.
+fn wsc_collect(input: &mut &str) -> Stretch {
+    let mut out = Stretch::default();
+    loop {
+        let ws = multispace0::<_, ()>.parse_next(input).unwrap_or("");
+        out.breaks += ws.matches('\n').count();
+        if !input.starts_with(';') {
+            break;
+        }
+        let _ = one_of::<_, _, ()>(';').parse_next(input);
+        let body = take_till::<_, _, ()>(0.., |c| c == '\n').parse_next(input).unwrap_or("");
+        let text = match parse_pragma(body, Span::new(0, 0), &PathBuf::new(), 0) {
+            None => Some(comment_text(body)),
+            Some(Ok(Pragma { value: PragmaValue::Doc(d), .. })) => Some(d),
+            Some(_) => None,
+        };
+        if let Some(t) = text {
+            out.comments.push((out.breaks, t));
+        }
+    }
+    out
+}
+
+// ── Source lines (dgtlrift/cddlc#9) ───────────────────────────────────────────
+
+/// The line holding `offset`: its number and text, trimmed.
+fn source_line(src: &str, path: &std::path::Path, offset: usize) -> SourceLine {
+    let offset = offset.min(src.len());
+    let start = src[..offset].rfind('\n').map_or(0, |i| i + 1);
+    let end = src[offset..].find('\n').map_or(src.len(), |i| offset + i);
+    SourceLine {
+        path: path.to_owned(),
+        line: line_of(src, offset),
+        text: src[start..end].trim().to_owned(),
+    }
+}
+
+fn sources_in_group(g: &mut GroupEntry, src: &str, path: &std::path::Path) {
+    for choice in &mut g.choices {
+        for e in &mut choice.entries {
+            e.node.source = Some(source_line(src, path, e.span.start));
+            match &mut e.node.kind {
+                MemberKind::KeyValue { value, .. } => sources_in_type(&mut value.node, src, path),
+                MemberKind::Type(t) => sources_in_type(&mut t.node, src, path),
+            }
+        }
+    }
+}
+
+fn sources_in_type(t: &mut Type, src: &str, path: &std::path::Path) {
+    for c in &mut t.choices {
+        match &mut c.node.base.node {
+            Type2::Map(g) | Type2::Array(g) | Type2::Group(g) | Type2::EnumGroup(g) => {
+                sources_in_group(&mut g.node, src, path);
+            }
+            Type2::Tagged { inner, .. } => sources_in_type(&mut inner.node, src, path),
+            _ => {}
+        }
+    }
 }
 
 fn col_of(src: &str, offset: usize) -> usize {
