@@ -32,7 +32,7 @@ pub mod parser;
 pub use ast::{
     CddlModule, CtlOp, GroupChoice, GroupEntry, Ident, MemberEntry, MemberKind,
     MemberKey, Occurrence, Pragma, PragmaValue, Rule, RuleKind, Span, Spanned,
-    Type, Type1, Type2, TypeOp, Value,
+    Type, Type1, Type2, TypeOp, Value, SourceLine,
 };
 pub use error::{ParseError, ParseResult, ParseWarning, WarningKind};
 pub use parser::{parse_cddl, parse_cddl_debug, parse_type_str, format_parse_diagnostic};

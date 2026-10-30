@@ -36,6 +36,15 @@ impl Span {
     }
 }
 
+/// Where an item was written: its file, its 1-based line, and that line's text,
+/// trimmed (dgtlrift/cddlc#9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLine {
+    pub path: std::path::PathBuf,
+    pub line: usize,
+    pub text: String,
+}
+
 /// A value together with its source span.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spanned<T> {
